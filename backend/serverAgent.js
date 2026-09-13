@@ -356,7 +356,7 @@ app.post('/:name/start', (req, res) => {
 app.post('/:name/stop', (req, res) => {
   const { name } = req.params;
   if (!VALID.includes(name)) return res.status(400).json({ error: 'Invalid server name' });
-  const { mode = 'exit', delay = 0 } = req.body;
+  const { mode = 'exit', delay = 0 } = req.body || {};
   res.json(stopServer(name, mode, parseInt(delay, 10) || 0));
 });
 
