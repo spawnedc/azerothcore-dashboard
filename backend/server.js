@@ -88,6 +88,8 @@ function isPrivateOrigin(origin) {
     if (/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)/.test(hostname)) return true;
     // IPv6 link-local / unique-local
     if (/^(fe80|fd[0-9a-f]{2}):/i.test(hostname)) return true;
+    // mDNS hostnames (e.g. "wow.local") used to reach this box by name on the LAN
+    if (/\.local$/i.test(hostname)) return true;
   } catch {}
   return false;
 }
