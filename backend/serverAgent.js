@@ -12,6 +12,17 @@
  * Multiple worldservers are supported via worldservers.json — see
  * worldservers.json.example.  When that file is absent the agent falls
  * back to the single WORLDSERVER_PATH defined in .env.
+ *
+ * Spawned servers are detached into their own process group (see
+ * startServer()), so a signal delivered to this agent's process group (e.g.
+ * a terminal/session teardown) won't reach them. That's independent of this
+ * process's own lifetime, though: if the agent process itself exits, these
+ * pipes close and the child gets SIGPIPE on its next log write. A pid file
+ * per server (see the PID files section below) lets a fresh agent instance
+ * recognize an already-running server on startup — whether it's one that
+ * outlived a previous agent process, or one started entirely outside the
+ * dashboard — but full console/log access to an adopted process is only
+ * available again once it's stopped and restarted through the agent.
  */
 
 require('dotenv').config({ path: require('path').join(__dirname, '../.env') });
@@ -21,6 +32,7 @@ const log     = require('./logger')('server-agent');
 const http    = require('http');
 const { spawn } = require('child_process');
 const path    = require('path');
+const fs      = require('fs');
 const wsConfig = require('./worldservers');
 
 const PORT   = parseInt(process.env.AGENT_PORT, 10) || 3002;
@@ -34,6 +46,76 @@ function sanitizeOutput(str) {
     .replace(/\x1B\[[0-9;]*[hl]/g, '')
     .replace(/\x1B\][^\x07]*\x07/g, '')
     .replace(/\x1B[^[\]m]/g, '');
+}
+
+// ── PID files (adoption of already-running instances) ──────────────────────────
+//
+// The agent's own restarts (crash, or its /restart API), or a server started
+// entirely outside the dashboard (e.g. via a plain shell alias), would
+// otherwise be invisible to a fresh agent instance — it only knows about
+// processes it spawned itself, in memory. A PID file per server lets a new
+// agent instance recognize "this is already running" instead of assuming
+// it's down (and possibly trying to double-start it).
+
+const RUN_DIR = path.join(__dirname, 'run');
+fs.mkdirSync(RUN_DIR, { recursive: true });
+
+function pidFilePath(serverName) {
+  return path.join(RUN_DIR, `${serverName}.pid`);
+}
+
+function writePidFile(serverName, pid) {
+  try { fs.writeFileSync(pidFilePath(serverName), String(pid)); } catch {}
+}
+
+function removePidFile(serverName) {
+  try { fs.unlinkSync(pidFilePath(serverName)); } catch {}
+}
+
+/** True if `pid` is alive (process.kill with signal 0 doesn't actually signal it). */
+function isAlive(pid) {
+  try { process.kill(pid, 0); return true; }
+  catch { return false; }
+}
+
+function expectedExePath(serverName) {
+  if (serverName === 'authserver') return process.env.AUTHSERVER_PATH;
+  return wsConfig.getById(serverName)?.path;
+}
+
+/**
+ * Check whether `pid` is actually running the executable expected for
+ * `serverName`. Resolves /proc/<pid>/exe (the kernel's own record of what's
+ * actually running) rather than comparing against /proc/<pid>/cmdline's
+ * argv[0] — the plain `start`/`wow` shell aliases launch these binaries with
+ * a relative argv0 (`./authserver`), which wouldn't string-match the agent's
+ * absolute configured path even though it's the same binary.
+ */
+function pidMatchesExe(pid, serverName) {
+  const expected = expectedExePath(serverName);
+  if (!expected) return false;
+  try {
+    const actual = fs.readlinkSync(`/proc/${pid}/exe`);
+    return actual === fs.realpathSync(expected);
+  } catch {
+    return false;
+  }
+}
+
+/** On agent startup, recognize a server that's already running from a leftover pid file. */
+function tryAdopt(serverName) {
+  let pid;
+  try { pid = parseInt(fs.readFileSync(pidFilePath(serverName), 'utf8'), 10); } catch { return; }
+  if (!pid || !isAlive(pid) || !pidMatchesExe(pid, serverName)) {
+    removePidFile(serverName);
+    return;
+  }
+  processes[serverName] = { pid, adopted: true };
+  processLogs[serverName] = [
+    `[Server Agent] Adopted already-running ${serverName} (pid ${pid}) — console/log ` +
+    `streaming is unavailable until it's restarted through the agent.\n`,
+  ];
+  log.info(`Adopted already-running ${serverName} (pid ${pid})`);
 }
 
 // Dynamic maps — one entry per worldserver + authserver
@@ -50,6 +132,11 @@ for (const ws of wsConfig.load()) {
   autoRestart[ws.id] = false;
   stopping[ws.id]    = false;
   startTimes[ws.id]  = null;
+}
+
+// Adopt anything already running before the HTTP API starts accepting requests.
+for (const name of ['authserver', ...wsConfig.getIds()]) {
+  tryAdopt(name);
 }
 
 const MAX_LOG_LINES = 2000;
@@ -97,15 +184,25 @@ function startServer(serverName) {
   try {
     stopping[serverName] = false;
     const cwd  = workDir || path.dirname(exePath);
+    // detached: true puts the child in its own process group, so a signal
+    // aimed at the agent's session/process group (e.g. a tmux session
+    // teardown) doesn't reach it. This does NOT protect against the agent's
+    // own Node process exiting normally — these stdio pipes are still owned
+    // by this process, so the child would still get SIGPIPE on its next log
+    // write once we're gone. That case is an accepted, documented gap (see
+    // the module doc comment at the top of this file).
     const proc = spawn(exePath, [], {
       cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: false,
+      detached: true,
     });
+    proc.unref();
 
     processes[serverName]   = proc;
     startTimes[serverName]  = Date.now();
     processLogs[serverName] = [`[Server Agent] Starting ${serverName} from ${exePath}\n`];
+    writePidFile(serverName, proc.pid);
 
     proc.stdout.on('data', (d) => emitLog(serverName, d));
     proc.stderr.on('data', (d) => emitLog(serverName, d));
@@ -114,6 +211,7 @@ function startServer(serverName) {
       emitLog(serverName, `\n[Server Agent] Process exited with code ${code}\n`);
       processes[serverName]  = null;
       startTimes[serverName] = null;
+      removePidFile(serverName);
       broadcast({ type: 'server-status', server: serverName, running: false });
 
       if (autoRestart[serverName] && !stopping[serverName]) {
@@ -127,6 +225,7 @@ function startServer(serverName) {
       emitLog(serverName, `\n[Server Agent] Failed to start: ${err.message}\n`);
       processes[serverName]  = null;
       startTimes[serverName] = null;
+      removePidFile(serverName);
       broadcast({ type: 'server-status', server: serverName, running: false });
       stopping[serverName] = false;
     });
@@ -143,6 +242,19 @@ function stopServer(serverName, mode = 'exit', delay = 0) {
   if (!proc) return { success: false, error: 'Server is not running' };
 
   stopping[serverName] = true;
+
+  // An adopted process (recognized via pid file, not spawned by us) has no
+  // stdin/stdout pipes to talk to — fall back to a plain signal, and update
+  // our own bookkeeping directly since we won't get a 'close' event for it.
+  if (proc.adopted) {
+    try { process.kill(proc.pid, 'SIGTERM'); } catch {}
+    processes[serverName]  = null;
+    startTimes[serverName] = null;
+    stopping[serverName]   = false;
+    removePidFile(serverName);
+    broadcast({ type: 'server-status', server: serverName, running: false });
+    return { success: true };
+  }
 
   if (wsConfig.isWorldserver(serverName)) {
     try {
@@ -171,6 +283,12 @@ function sendCommand(command, serverName) {
   if (!target) return { success: false, error: 'No worldserver configured' };
   const proc = processes[target];
   if (!proc) return { success: false, error: `${target} is not running` };
+  if (proc.adopted) {
+    return {
+      success: false,
+      error: 'Cannot send console commands to a server started outside the agent — stop and restart it from the dashboard to enable this.',
+    };
+  }
   try {
     proc.stdin.write(command + '\n');
     return { success: true };
@@ -180,6 +298,14 @@ function sendCommand(command, serverName) {
 }
 
 function getStatus(serverName) {
+  // Adopted processes don't get a 'close' event when they exit (we didn't
+  // spawn them), so check liveness lazily whenever status is actually read.
+  const proc = processes[serverName];
+  if (proc?.adopted && !isAlive(proc.pid)) {
+    processes[serverName] = null;
+    removePidFile(serverName);
+  }
+
   return {
     running:     processes[serverName] !== null,
     autoRestart: autoRestart[serverName],

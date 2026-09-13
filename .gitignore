@@ -5,6 +5,7 @@
 backups/
 pdump/
 worldservers.json
+backend/run/
 
 # compiled output
 /dist
