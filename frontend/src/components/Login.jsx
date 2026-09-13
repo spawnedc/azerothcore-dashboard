@@ -36,7 +36,7 @@ export default function Login() {
       <div className="login-box">
         <div className="login-logo">
           <div className="login-emblem">
-            <img src="../../img/icon.png" alt="image" width="64" height="auto"></img>
+            <img src="/img/icon.png" alt="image" width="64" height="auto"></img>
           </div>
           <h1>AzerothCore</h1>
           <p>Server Dashboard</p>

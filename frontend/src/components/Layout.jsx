@@ -324,7 +324,7 @@ export default function Layout() {
       <aside className={`sidebar${sidebarOpen ? ' sidebar-open' : ''}`}>
         <div className="sidebar-brand">
           <span className="brand-icon">
-            <img src="../../img/icon.png" alt="image" width="38" height="auto" />
+            <img src="/img/icon.png" alt="image" width="38" height="auto" />
           </span>
           <div>
             <div className="brand-name">AzerothCore</div>
